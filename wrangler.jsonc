@@ -6,7 +6,11 @@
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "worker-api-proxy",
 	"main": "src/index.js",
-	"compatibility_date": "2026-03-10",
+	"compatibility_date": "2024-01-01",
+	"vars": {
+		"CF_ACCOUNT_ID": "39c9f4f490e0475ce7a4a4e2e30f3334",
+		"GATEWAY_NAME": "worker-api-proxy"
+	},
 	"observability": {
 		"enabled": true
 	},
