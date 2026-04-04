@@ -2,7 +2,39 @@
 
 OpenAI-compatible Cloudflare Worker that routes requests to model pools instead of exposing provider keys directly.
 
-It is designed for simple clients such as n8n, custom scripts, or any OpenAI-compatible SDK that can send requests to a custom base URL.
+**This Worker is a backend proxy, not a standalone service.** It is intended to sit behind another system — such as an n8n automation workflow, a custom backend, or an internal tool — that holds the `MASTER_KEY` and calls this Worker on behalf of users or processes. End users should never call this Worker directly.
+
+It is designed for backend clients such as n8n, custom scripts, or any OpenAI-compatible SDK that can be pointed at a custom base URL.
+
+## Architecture Overview
+
+```mermaid
+flowchart LR
+    subgraph Clients["Your Clients"]
+        n8n["n8n / script\n/ SDK"]
+    end
+
+    subgraph CF["Cloudflare"]
+        Worker["worker-api-proxy\n(Cloudflare Worker)"]
+        Gateway["AI Gateway\n(logging, caching)"]
+    end
+
+    subgraph Providers["AI Providers"]
+        Gemini["Google AI Studio\n(Gemini pool-pro / flash / lite)"]
+        GitHub["GitHub Models\n(DeepSeek V3)"]
+    end
+
+    n8n -->|"Authorization: Bearer MASTER_KEY"| Worker
+    Worker -->|"cf-aig-authorization: Bearer CF_API_TOKEN\n+ GEMINI_KEY_x"| Gateway
+    Worker -->|"GITHUB_TOKEN"| GitHub
+    Gateway --> Gemini
+```
+
+**Each layer only sees its own key:**
+- Clients send `MASTER_KEY` — they never see provider keys
+- The Worker sends `CF_API_TOKEN` to AI Gateway and rotates `GEMINI_KEY_x` for Google
+- DeepSeek bypasses the gateway and is called directly with `GITHUB_TOKEN`
+- AI Gateway adds logging, caching, and cost tracking for all Gemini traffic
 
 ## What It Does
 
