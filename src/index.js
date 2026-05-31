@@ -3,85 +3,83 @@
  * OpenAI-compatible proxy with smart key rotation and per-pool thinking config.
  *
  * Pool reference:
- *  pool-2.5-tools   → gemini-2.5-flash  | thinking OFF (reasoning_effort:none) | BEST for tools/file ops
- *  pool-flash       → gemini-3.5-flash  | thinking_level: minimal              | light tool use
- *  pool-flash-low   → gemini-3.5-flash  | thinking_level: low
- *  pool-flash-med   → gemini-3.5-flash  | thinking_level: medium
- *  pool-flash-high  → gemini-3.5-flash  | thinking_level: high                 | deep reasoning, no tools
- *  pool-lite        → gemini-3.1-flash-lite | default (thinking off by default) | fastest/cheapest
+ * pool-2.5-tools   → gemini-2.5-flash  | thinking OFF (reasoning_effort:none) | BEST for tools/file ops
+ * pool-flash       → gemini-3.5-flash  | thinking_level: minimal             | light tool use
+ * pool-flash-low   → gemini-3.5-flash  | thinking_level: low
+ * pool-flash-med   → gemini-3.5-flash  | thinking_level: medium
+ * pool-flash-high  → gemini-3.5-flash  | thinking_level: high                 | deep reasoning, no tools
+ * pool-lite        → gemini-3.1-flash-lite | default (thinking off by default) | fastest/cheapest
  */
 
 // ─── Pool definitions ─────────────────────────────────────────────────────────
-// `thinking` encodes what the Worker injects into each request before forwarding.
-// null = don't touch thinking config (model default).
 const POOLS = {
-
-  // ── Gemini 2.5 Flash — thinking completely OFF ────────────────────────────
-  // Use for: any task that involves tool calls / file reads / folder access.
-  // reasoning_effort:"none" is the OpenAI-compat way to set thinking_budget:0 on 2.5 models.
-  // No thought signatures generated → tools work reliably across multi-turn conversations.
   'pool-2.5-tools': {
     model: 'gemini-2.5-flash',
-    keys: ['GEMINI_KEY_1', 'GEMINI_KEY_2', 'GEMINI_KEY_3',
-           'GEMINI_KEY_4', 'GEMINI_KEY_5', 'GEMINI_KEY_6'],
+    keys: ['GEMINI_KEY_1', 'GEMINI_KEY_2', 'GEMINI_KEY_3', 'GEMINI_KEY_4', 'GEMINI_KEY_5', 'GEMINI_KEY_6'],
     thinking: { type: '2.5', reasoning_effort: 'none' }
   },
-
-  // ── Gemini 3.5 Flash — minimal thinking ──────────────────────────────────
-  // Use for: general coding tasks, light tool use.
-  // Note: even at minimal level, thought signatures exist. Works for single-turn
-  // tool calls but may fail in deep multi-turn tool loops. Use pool-2.5-tools instead.
   'pool-flash': {
     model: 'gemini-3.5-flash',
-    keys: ['GEMINI_KEY_1', 'GEMINI_KEY_2', 'GEMINI_KEY_3',
-           'GEMINI_KEY_4', 'GEMINI_KEY_5', 'GEMINI_KEY_6'],
+    keys: ['GEMINI_KEY_1', 'GEMINI_KEY_2', 'GEMINI_KEY_3', 'GEMINI_KEY_4', 'GEMINI_KEY_5', 'GEMINI_KEY_6'],
     thinking: { type: '3.x', thinking_level: 'minimal' }
   },
-
-  // ── Gemini 3.5 Flash — low thinking ──────────────────────────────────────
-  // Use for: balanced reasoning + speed. Good general purpose.
   'pool-flash-low': {
     model: 'gemini-3.5-flash',
-    keys: ['GEMINI_KEY_1', 'GEMINI_KEY_2', 'GEMINI_KEY_3',
-           'GEMINI_KEY_4', 'GEMINI_KEY_5', 'GEMINI_KEY_6'],
+    keys: ['GEMINI_KEY_1', 'GEMINI_KEY_2', 'GEMINI_KEY_3', 'GEMINI_KEY_4', 'GEMINI_KEY_5', 'GEMINI_KEY_6'],
     thinking: { type: '3.x', thinking_level: 'low' }
   },
-
-  // ── Gemini 3.5 Flash — medium thinking ───────────────────────────────────
-  // Use for: architecture planning, complex code review, analysis.
   'pool-flash-med': {
     model: 'gemini-3.5-flash',
-    keys: ['GEMINI_KEY_1', 'GEMINI_KEY_2', 'GEMINI_KEY_3',
-           'GEMINI_KEY_4', 'GEMINI_KEY_5', 'GEMINI_KEY_6'],
+    keys: ['GEMINI_KEY_1', 'GEMINI_KEY_2', 'GEMINI_KEY_3', 'GEMINI_KEY_4', 'GEMINI_KEY_5', 'GEMINI_KEY_6'],
     thinking: { type: '3.x', thinking_level: 'medium' }
   },
-
-  // ── Gemini 3.5 Flash — high thinking ─────────────────────────────────────
-  // Use for: deep research, hard problems, math. DO NOT use with tools.
-  // High thinking produces large thought signatures — multi-turn tool calls will fail.
   'pool-flash-high': {
     model: 'gemini-3.5-flash',
-    keys: ['GEMINI_KEY_1', 'GEMINI_KEY_2', 'GEMINI_KEY_3',
-           'GEMINI_KEY_4', 'GEMINI_KEY_5', 'GEMINI_KEY_6'],
+    keys: ['GEMINI_KEY_1', 'GEMINI_KEY_2', 'GEMINI_KEY_3', 'GEMINI_KEY_4', 'GEMINI_KEY_5', 'GEMINI_KEY_6'],
     thinking: { type: '3.x', thinking_level: 'high' },
-    disableTools: true // Worker will reject tool-use requests to this pool
+    disableTools: true 
   },
-
-  // ── Gemini 3.1 Flash Lite — default ──────────────────────────────────────
-  // Use for: fast cheap tasks, summaries, classifications.
-  // thinking is OFF by default on Flash-Lite — tools work fine.
   'pool-lite': {
     model: 'gemini-3.1-flash-lite',
-    keys: ['GEMINI_KEY_1', 'GEMINI_KEY_2', 'GEMINI_KEY_3',
-           'GEMINI_KEY_4', 'GEMINI_KEY_5', 'GEMINI_KEY_6'],
+    keys: ['GEMINI_KEY_1', 'GEMINI_KEY_2', 'GEMINI_KEY_3', 'GEMINI_KEY_4', 'GEMINI_KEY_5', 'GEMINI_KEY_6'],
     thinking: null
   }
 };
 
-// ─── Round-robin counters + rate limit map ────────────────────────────────────
+// ─── Counters & Rate limit tracking ──────────────────────────────────────────
 const counters   = {};
-const rateLimits = new Map(); // apiKey → expiry timestamp
-const COOLDOWN_MS = 60 * 1000; // 1-minute cooldown on 429
+const rateLimits = new Map(); 
+const COOLDOWN_MS = 60 * 1000; 
+
+// ─── Ephemeral Memory Fallback (For Local Dev without KV) ─────────────────────
+const memCache = new Map();
+
+// Generate a deterministic SHA-256 fingerprint of the message history context
+async function getCacheKey(messages) {
+  const str = messages
+    .map(m => `${m.role}:${m.content ? (typeof m.content === 'string' ? m.content : JSON.stringify(m.content)) : ''}`)
+    .join('\n');
+  const msgUint8 = new TextEncoder().encode(str);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', msgUint8);
+  return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function saveSignature(key, signature, env) {
+  if (env.SIGNATURE_KV) {
+    // Save to distributed KV namespace with a 10-minute time-to-live
+    await env.SIGNATURE_KV.put(key, signature, { expirationTtl: 600 });
+  } else {
+    if (memCache.size >= 1000) memCache.delete(memCache.keys().next().value);
+    memCache.set(key, signature);
+  }
+}
+
+async function getSignature(key, env) {
+  if (env.SIGNATURE_KV) {
+    return await env.SIGNATURE_KV.get(key);
+  }
+  return memCache.get(key);
+}
 
 // ─── Key selection ────────────────────────────────────────────────────────────
 function getNextKey(poolName, pool, env) {
@@ -116,29 +114,20 @@ function getNextKey(poolName, pool, env) {
 }
 
 // ─── Apply thinking config per pool ──────────────────────────────────────────
-// Injects the correct thinking parameters based on model generation.
-// IMPORTANT: never mix thinking_budget (2.5) with thinking_level (3.x).
 function applyThinkingConfig(body, pool) {
   const cfg = pool.thinking;
-  if (!cfg) return body; // pool-lite: leave defaults untouched
+  if (!cfg) return body;
 
-  // Strip any client-supplied thinking params to avoid conflicts
   delete body.thinking_config;
   delete body.reasoning_effort;
 
-  // Ensure extra_body.google exists
   body.extra_body = body.extra_body || {};
   body.extra_body.google = body.extra_body.google || {};
-  delete body.extra_body.google.thinking_config; // remove stale client value
+  delete body.extra_body.google.thinking_config;
 
   if (cfg.type === '2.5') {
-    // Gemini 2.5 models: use reasoning_effort at top level (OpenAI compat)
-    // "none" maps to thinking_budget:0 — fully disables thinking, no thought signatures
-    body.reasoning_effort = cfg.reasoning_effort; // "none"
+    body.reasoning_effort = cfg.reasoning_effort; 
   } else if (cfg.type === '3.x') {
-    // Gemini 3.x models: use extra_body.google.thinking_config.thinking_level
-    // Valid values: "minimal" | "low" | "medium" | "high"
-    // Cannot be disabled — "minimal" is the floor
     body.extra_body.google.thinking_config = {
       thinking_level: cfg.thinking_level
     };
@@ -147,19 +136,37 @@ function applyThinkingConfig(body, pool) {
   return body;
 }
 
-// ─── Upstream call with key rotation ─────────────────────────────────────────
+// ─── Upstream call with key rotation + signature state injection ──────────────
 async function callWithRetry(origBody, poolName, pool, env) {
   const totalKeys = pool.keys.filter(k => Boolean(env[k])).length;
   if (totalKeys === 0) throw new Error(`No keys for pool "${poolName}"`);
 
-  // Apply model name + thinking config before forwarding
-  let body = { ...origBody, model: pool.model };
+  // Deep clone input context to keep the injection cycle non-destructive
+  let messages = JSON.parse(JSON.stringify(origBody.messages || []));
+
+  // Auto-inject missing thought signatures back into replayed context turns
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (msg.role === 'assistant' && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
+      const contextKey = await getCacheKey(messages.slice(0, i));
+      const cachedSig = await getSignature(contextKey, env);
+      if (cachedSig) {
+        const firstToolCall = msg.tool_calls[0];
+        firstToolCall.extra_content = firstToolCall.extra_content || {};
+        firstToolCall.extra_content.google = firstToolCall.extra_content.google || {};
+        firstToolCall.extra_content.google.thought_signature = cachedSig;
+      }
+    }
+  }
+
+  let body = { ...origBody, messages, model: pool.model };
   body = applyThinkingConfig(body, pool);
   const bodyStr = JSON.stringify(body);
 
+  const currentRequestKey = await getCacheKey(origBody.messages || []);
+
   for (let attempt = 0; attempt < totalKeys; attempt++) {
     const apiKey = getNextKey(poolName, pool, env);
-
     const url = `https://gateway.ai.cloudflare.com/v1/${env.CF_ACCOUNT_ID}/${env.GATEWAY_NAME}/google-ai-studio/v1beta/openai/chat/completions`;
 
     const headers = {
@@ -179,14 +186,13 @@ async function callWithRetry(origBody, poolName, pool, env) {
     }
 
     if (!response.ok) {
-      if (response.status >= 500) continue; // retry on server errors
+      if (response.status >= 500) continue; 
       const errText = await response.text().catch(() => '');
       const err = new Error(`Upstream error: ${errText}`);
       err.status = response.status;
       throw err;
     }
 
-    // Stream-safe passthrough
     const respHeaders = new Headers({
       'Content-Type':               response.headers.get('Content-Type') || 'application/json',
       'Access-Control-Allow-Origin': '*'
@@ -196,13 +202,75 @@ async function callWithRetry(origBody, poolName, pool, env) {
       respHeaders.set('Connection',    'keep-alive');
     }
 
-    return new Response(response.body, { status: 200, headers: respHeaders });
+    // Capture response signatures
+    if (!body.stream) {
+      const cloneResp = response.clone();
+      try {
+        const json = await cloneResp.json();
+        const toolCalls = json.choices?.[0]?.message?.tool_calls;
+        if (Array.isArray(toolCalls)) {
+          for (const tc of toolCalls) {
+            const sig = tc.extra_content?.google?.thought_signature;
+            if (sig) {
+              await saveSignature(currentRequestKey, sig, env);
+              break; 
+            }
+          }
+        }
+      } catch (e) {
+        console.error('JSON signature extract failed:', e);
+      }
+      return response;
+    } else {
+      // Structured SSE streaming line parser
+      const { readable, writable } = new TransformStream();
+      const reader = response.body.getReader();
+      const writer = writable.getWriter();
+      const decoder = new TextDecoder();
+      let lineBuffer = '';
+
+      (async () => {
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) {
+              writer.close();
+              break;
+            }
+            await writer.write(value);
+
+            lineBuffer += decoder.decode(value, { stream: true });
+            const lines = lineBuffer.split('\n');
+            lineBuffer = lines.pop() || '';
+
+            for (const line of lines) {
+              const trimmed = line.trim();
+              if (trimmed.startsWith('data: ')) {
+                const jsonStr = trimmed.slice(6);
+                if (jsonStr === '[DONE]') continue;
+                try {
+                  const parsed = JSON.parse(jsonStr);
+                  const sig = parsed.choices?.[0]?.delta?.tool_calls?.[0]?.extra_content?.google?.thought_signature;
+                  if (sig) {
+                    await saveSignature(currentRequestKey, sig, env);
+                  }
+                } catch {
+                  // Keep going on incomplete stream pieces
+                }
+              }
+            }
+          }
+        } catch (err) {
+          writer.abort(err);
+        }
+      })();
+
+      return new Response(readable, { status: 200, headers: respHeaders });
+    }
   }
 
-  // All keys failed
   const now = Date.now();
-  const expiries = pool.keys.map(k => env[k]).filter(Boolean)
-    .map(k => rateLimits.get(k)).filter(Boolean);
+  const expiries = pool.keys.map(k => env[k]).filter(Boolean).map(k => rateLimits.get(k)).filter(Boolean);
   const err = new Error(`All keys failing for pool "${poolName}".`);
   err.status = 429;
   if (expiries.length) {
@@ -223,7 +291,6 @@ function jsonResponse(payload, status = 200) {
   });
 }
 
-// Relaxed validation: content can be string OR array (tool results, multimodal)
 function isValidChatBody(body) {
   if (!body || typeof body !== 'object')   return false;
   if (!body.model || typeof body.model !== 'string') return false;
@@ -238,8 +305,6 @@ function isValidChatBody(body) {
 // ─── Main fetch handler ───────────────────────────────────────────────────────
 export default {
   async fetch(request, env) {
-
-    // CORS preflight
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         headers: {
@@ -252,7 +317,6 @@ export default {
 
     const url = new URL(request.url);
 
-    // Health check
     if (url.pathname === '/health') {
       return jsonResponse({
         status: 'ok',
@@ -265,7 +329,6 @@ export default {
       return new Response('Not found', { status: 404 });
     }
 
-    // Auth
     const auth        = request.headers.get('Authorization') || '';
     const expectedAuth = `Bearer ${env.MASTER_KEY}`;
 
@@ -277,7 +340,6 @@ export default {
       return jsonResponse({ error: 'Unauthorized' }, 401);
     }
 
-    // Parse body
     let body;
     try {
       body = await request.json();
@@ -300,7 +362,6 @@ export default {
       }, 400);
     }
 
-    // Block tool calls on high-thinking pool
     if (pool.disableTools && body.tools) {
       return jsonResponse({
         error: `Tool use is not allowed for "${poolName}" (high thinking mode). Use pool-2.5-tools for tool calls.`
@@ -313,7 +374,7 @@ export default {
       if (err?.status === 429) {
         const resp = { error: err.message };
         if (err.retryAfter    != null) resp.retry_after_ms = err.retryAfter;
-        if (err.earliestExpiry)        resp.renew_at       = new Date(err.earliestExpiry).toISOString();
+        if (err.earliestExpiry)       resp.renew_at       = new Date(err.earliestExpiry).toISOString();
         return jsonResponse(resp, 429);
       }
       return jsonResponse({ error: err.message || 'Request failed' }, err?.status || 500);

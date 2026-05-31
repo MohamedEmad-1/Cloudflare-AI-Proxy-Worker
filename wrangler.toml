@@ -1,0 +1,3 @@
+[[kv_namespaces]]
+binding = "SIGNATURE_KV"
+id = "your_kv_namespace_id_here"
