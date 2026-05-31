@@ -7,7 +7,7 @@
  * pool-flash       → gemini-3.5-flash  | thinking_level: minimal             | light tool use
  * pool-flash-low   → gemini-3.5-flash  | thinking_level: low
  * pool-flash-med   → gemini-3.5-flash  | thinking_level: medium
- * pool-flash-high  → gemini-3.5-flash  | thinking_level: high                 | deep reasoning, no tools
+ * pool-flash-high  → gemini-3.5-flash  | thinking_level: high                | deep reasoning, no tools
  * pool-lite        → gemini-3.1-flash-lite | default (thinking off by default) | fastest/cheapest
  */
 
@@ -37,7 +37,7 @@ const POOLS = {
     model: 'gemini-3.5-flash',
     keys: ['GEMINI_KEY_1', 'GEMINI_KEY_2', 'GEMINI_KEY_3', 'GEMINI_KEY_4', 'GEMINI_KEY_5', 'GEMINI_KEY_6'],
     thinking: { type: '3.x', thinking_level: 'high' },
-    disableTools: false
+    disableTools: true
   },
   'pool-lite': {
     model: 'gemini-3.1-flash-lite',
@@ -55,8 +55,7 @@ const COOLDOWN_MS = 60 * 1000;
 const memCache = new Map();
 
 // Generate a deterministic SHA-256 fingerprint of the message history context
-// Strip any injected `thought_signature` values so the fingerprint is stable
-// whether signatures are present or not (fixes cache-key mismatch bug).
+// Extracts only core content parameters to avoid hash-mismatches from structural metadata changes.
 async function getCacheKey(messages) {
   messages = messages || [];
 
@@ -68,15 +67,17 @@ async function getCacheKey(messages) {
         : '';
 
       let tcStr = '';
-      if (Array.isArray(m && m.tool_calls)) {
+      if (m && Array.isArray(m.tool_calls)) {
         try {
-          const cleaned = m.tool_calls.map(tc => {
-            const copy = JSON.parse(JSON.stringify(tc));
-            if (copy.extra_content && copy.extra_content.google && copy.extra_content.google.thought_signature) {
-              delete copy.extra_content.google.thought_signature;
-            }
-            return copy;
-          });
+          // Isolate core features only; entirely discards transient extra_content
+          const cleaned = m.tool_calls.map(tc => ({
+            id: tc.id,
+            type: tc.type,
+            function: tc.function ? {
+              name: tc.function.name,
+              arguments: tc.function.arguments
+            } : undefined
+          }));
           tcStr = JSON.stringify(cleaned);
         } catch (e) {
           tcStr = '';
@@ -94,11 +95,8 @@ async function getCacheKey(messages) {
 
 async function saveSignature(key, signature, env) {
   if (env.SIGNATURE_KV) {
-    // Save to distributed KV namespace with a 10-minute time-to-live
     await env.SIGNATURE_KV.put(key, signature, { expirationTtl: 600 });
   } else {
-    // Falling back to an in-memory cache is fine for local dev, but will not
-    // survive worker spin-downs. Warn once so users bind a KV namespace.
     if (!saveSignature._warned) {
       console.warn('SIGNATURE_KV not bound: using ephemeral in-memory cache. Bind SIGNATURE_KV to a KV namespace to preserve thought signatures across long agent runs.');
       saveSignature._warned = true;
@@ -154,14 +152,12 @@ function applyThinkingConfig(body, pool) {
 
   delete body.thinking_config;
   delete body.reasoning_effort;
-
-  body.extra_body = body.extra_body || {};
-  body.extra_body.google = body.extra_body.google || {};
-  delete body.extra_body.google.thinking_config;
+  delete body.extra_body?.google?.thinking_config;
 
   if (cfg.type === '2.5') {
     body.reasoning_effort = cfg.reasoning_effort; 
   } else if (cfg.type === '3.x') {
+    body.extra_body.google = body.extra_body.google || {};
     body.extra_body.google.thinking_config = {
       thinking_level: cfg.thinking_level
     };
@@ -175,7 +171,6 @@ async function callWithRetry(origBody, poolName, pool, env) {
   const totalKeys = pool.keys.filter(k => Boolean(env[k])).length;
   if (totalKeys === 0) throw new Error(`No keys for pool "${poolName}"`);
 
-  // Deep clone input context to keep the injection cycle non-destructive
   let messages = JSON.parse(JSON.stringify(origBody.messages || []));
 
   // Auto-inject missing thought signatures back into replayed context turns
@@ -193,7 +188,13 @@ async function callWithRetry(origBody, poolName, pool, env) {
     }
   }
 
-  let body = { ...origBody, messages, model: pool.model };
+  // Deep-clone extra_body metadata block to completely isolate mutations from original tracking references
+  let body = { 
+    ...origBody, 
+    messages, 
+    model: pool.model,
+    extra_body: origBody.extra_body ? JSON.parse(JSON.stringify(origBody.extra_body)) : {}
+  };
   body = applyThinkingConfig(body, pool);
   const bodyStr = JSON.stringify(body);
 
@@ -236,20 +237,21 @@ async function callWithRetry(origBody, poolName, pool, env) {
       respHeaders.set('Connection',    'keep-alive');
     }
 
-    // Capture response signatures
+    // Capture response signatures (Non-Stream mode)
     if (!body.stream) {
       const cloneResp = response.clone();
       try {
         const json = await cloneResp.json();
-        const toolCalls = json.choices?.[0]?.message?.tool_calls;
-        if (Array.isArray(toolCalls)) {
-          for (const tc of toolCalls) {
-            const sig = tc.extra_content?.google?.thought_signature;
-            if (sig) {
-              await saveSignature(currentRequestKey, sig, env);
-              break; 
-            }
-          }
+        const choice = json.choices?.[0];
+        
+        // Scan tool calls first, then fallback to root message properties
+        let sig = choice?.message?.tool_calls?.[0]?.extra_content?.google?.thought_signature;
+        if (!sig) {
+          sig = choice?.message?.extra_content?.google?.thought_signature;
+        }
+
+        if (sig) {
+          await saveSignature(currentRequestKey, sig, env);
         }
       } catch (e) {
         console.error('JSON signature extract failed:', e);
@@ -284,7 +286,12 @@ async function callWithRetry(origBody, poolName, pool, env) {
                 if (jsonStr === '[DONE]') continue;
                 try {
                   const parsed = JSON.parse(jsonStr);
-                  const sig = parsed.choices?.[0]?.delta?.tool_calls?.[0]?.extra_content?.google?.thought_signature;
+                  const delta = parsed.choices?.[0]?.delta;
+                  
+                  // Extract signature from delta tool calls or directly from the baseline delta block
+                  const sig = delta?.tool_calls?.[0]?.extra_content?.google?.thought_signature ||
+                              delta?.extra_content?.google?.thought_signature;
+
                   if (sig) {
                     await saveSignature(currentRequestKey, sig, env);
                   }
