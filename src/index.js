@@ -37,7 +37,7 @@ const POOLS = {
     model: 'gemini-3.5-flash',
     keys: ['GEMINI_KEY_1', 'GEMINI_KEY_2', 'GEMINI_KEY_3', 'GEMINI_KEY_4', 'GEMINI_KEY_5', 'GEMINI_KEY_6'],
     thinking: { type: '3.x', thinking_level: 'high' },
-    disableTools: true 
+    disableTools: false
   },
   'pool-lite': {
     model: 'gemini-3.1-flash-lite',
@@ -55,10 +55,38 @@ const COOLDOWN_MS = 60 * 1000;
 const memCache = new Map();
 
 // Generate a deterministic SHA-256 fingerprint of the message history context
+// Strip any injected `thought_signature` values so the fingerprint is stable
+// whether signatures are present or not (fixes cache-key mismatch bug).
 async function getCacheKey(messages) {
+  messages = messages || [];
+
   const str = messages
-    .map(m => `${m.role}:${m.content ? (typeof m.content === 'string' ? m.content : JSON.stringify(m.content)) : ''}`)
+    .map(m => {
+      const role = m && m.role ? m.role : '';
+      const contentStr = m && m.content
+        ? (typeof m.content === 'string' ? m.content : JSON.stringify(m.content))
+        : '';
+
+      let tcStr = '';
+      if (Array.isArray(m && m.tool_calls)) {
+        try {
+          const cleaned = m.tool_calls.map(tc => {
+            const copy = JSON.parse(JSON.stringify(tc));
+            if (copy.extra_content && copy.extra_content.google && copy.extra_content.google.thought_signature) {
+              delete copy.extra_content.google.thought_signature;
+            }
+            return copy;
+          });
+          tcStr = JSON.stringify(cleaned);
+        } catch (e) {
+          tcStr = '';
+        }
+      }
+
+      return `${role}:${contentStr}:${tcStr}`;
+    })
     .join('\n');
+
   const msgUint8 = new TextEncoder().encode(str);
   const hashBuffer = await crypto.subtle.digest('SHA-256', msgUint8);
   return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
@@ -69,6 +97,12 @@ async function saveSignature(key, signature, env) {
     // Save to distributed KV namespace with a 10-minute time-to-live
     await env.SIGNATURE_KV.put(key, signature, { expirationTtl: 600 });
   } else {
+    // Falling back to an in-memory cache is fine for local dev, but will not
+    // survive worker spin-downs. Warn once so users bind a KV namespace.
+    if (!saveSignature._warned) {
+      console.warn('SIGNATURE_KV not bound: using ephemeral in-memory cache. Bind SIGNATURE_KV to a KV namespace to preserve thought signatures across long agent runs.');
+      saveSignature._warned = true;
+    }
     if (memCache.size >= 1000) memCache.delete(memCache.keys().next().value);
     memCache.set(key, signature);
   }
