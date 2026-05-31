@@ -1,188 +1,283 @@
 /**
- * Welcome to Cloudflare Workers! AI Router
+ * AI Router — Cloudflare Worker
+ * OpenAI-compatible proxy with smart key rotation and per-pool thinking config.
+ *
+ * Pool reference:
+ *  pool-2.5-tools   → gemini-2.5-flash  | thinking OFF (reasoning_effort:none) | BEST for tools/file ops
+ *  pool-flash       → gemini-3.5-flash  | thinking_level: minimal              | light tool use
+ *  pool-flash-low   → gemini-3.5-flash  | thinking_level: low
+ *  pool-flash-med   → gemini-3.5-flash  | thinking_level: medium
+ *  pool-flash-high  → gemini-3.5-flash  | thinking_level: high                 | deep reasoning, no tools
+ *  pool-lite        → gemini-3.1-flash-lite | default (thinking off by default) | fastest/cheapest
  */
 
-// Logical model pools exposed to clients. The incoming request uses one of
-// these aliases in `body.model`, and the worker swaps it to the real upstream model.
+// ─── Pool definitions ─────────────────────────────────────────────────────────
+// `thinking` encodes what the Worker injects into each request before forwarding.
+// null = don't touch thinking config (model default).
 const POOLS = {
-  'pool-pro': {
-    provider: 'gemini',
-    model: 'gemini-3.1-pro-preview',
-    keys: ['GEMINI_KEY_1', 'GEMINI_KEY_2', 'GEMINI_KEY_3', 'GEMINI_KEY_4', 'GEMINI_KEY_5', 'GEMINI_KEY_6']
+
+  // ── Gemini 2.5 Flash — thinking completely OFF ────────────────────────────
+  // Use for: any task that involves tool calls / file reads / folder access.
+  // reasoning_effort:"none" is the OpenAI-compat way to set thinking_budget:0 on 2.5 models.
+  // No thought signatures generated → tools work reliably across multi-turn conversations.
+  'pool-2.5-tools': {
+    model: 'gemini-2.5-flash',
+    keys: ['GEMINI_KEY_1', 'GEMINI_KEY_2', 'GEMINI_KEY_3',
+           'GEMINI_KEY_4', 'GEMINI_KEY_5', 'GEMINI_KEY_6'],
+    thinking: { type: '2.5', reasoning_effort: 'none' }
   },
+
+  // ── Gemini 3.5 Flash — minimal thinking ──────────────────────────────────
+  // Use for: general coding tasks, light tool use.
+  // Note: even at minimal level, thought signatures exist. Works for single-turn
+  // tool calls but may fail in deep multi-turn tool loops. Use pool-2.5-tools instead.
   'pool-flash': {
-    provider: 'gemini',
-    model: 'gemini-3-flash-preview',
-    keys: ['GEMINI_KEY_1', 'GEMINI_KEY_2', 'GEMINI_KEY_3', 'GEMINI_KEY_4', 'GEMINI_KEY_5', 'GEMINI_KEY_6']
+    model: 'gemini-3.5-flash',
+    keys: ['GEMINI_KEY_1', 'GEMINI_KEY_2', 'GEMINI_KEY_3',
+           'GEMINI_KEY_4', 'GEMINI_KEY_5', 'GEMINI_KEY_6'],
+    thinking: { type: '3.x', thinking_level: 'minimal' }
   },
-  'pool-flash-lite': {
-    provider: 'gemini',
-    model: 'gemini-3.1-flash-lite-preview',
-    keys: ['GEMINI_KEY_1', 'GEMINI_KEY_2', 'GEMINI_KEY_3', 'GEMINI_KEY_4', 'GEMINI_KEY_5', 'GEMINI_KEY_6']
+
+  // ── Gemini 3.5 Flash — low thinking ──────────────────────────────────────
+  // Use for: balanced reasoning + speed. Good general purpose.
+  'pool-flash-low': {
+    model: 'gemini-3.5-flash',
+    keys: ['GEMINI_KEY_1', 'GEMINI_KEY_2', 'GEMINI_KEY_3',
+           'GEMINI_KEY_4', 'GEMINI_KEY_5', 'GEMINI_KEY_6'],
+    thinking: { type: '3.x', thinking_level: 'low' }
   },
-  'deepseekv3': {
-    provider: 'github-models',
-    model: 'deepseek/DeepSeek-V3-0324',
-    keys: ['GITHUB_TOKEN']
+
+  // ── Gemini 3.5 Flash — medium thinking ───────────────────────────────────
+  // Use for: architecture planning, complex code review, analysis.
+  'pool-flash-med': {
+    model: 'gemini-3.5-flash',
+    keys: ['GEMINI_KEY_1', 'GEMINI_KEY_2', 'GEMINI_KEY_3',
+           'GEMINI_KEY_4', 'GEMINI_KEY_5', 'GEMINI_KEY_6'],
+    thinking: { type: '3.x', thinking_level: 'medium' }
+  },
+
+  // ── Gemini 3.5 Flash — high thinking ─────────────────────────────────────
+  // Use for: deep research, hard problems, math. DO NOT use with tools.
+  // High thinking produces large thought signatures — multi-turn tool calls will fail.
+  'pool-flash-high': {
+    model: 'gemini-3.5-flash',
+    keys: ['GEMINI_KEY_1', 'GEMINI_KEY_2', 'GEMINI_KEY_3',
+           'GEMINI_KEY_4', 'GEMINI_KEY_5', 'GEMINI_KEY_6'],
+    thinking: { type: '3.x', thinking_level: 'high' },
+    disableTools: true // Worker will reject tool-use requests to this pool
+  },
+
+  // ── Gemini 3.1 Flash Lite — default ──────────────────────────────────────
+  // Use for: fast cheap tasks, summaries, classifications.
+  // thinking is OFF by default on Flash-Lite — tools work fine.
+  'pool-lite': {
+    model: 'gemini-3.1-flash-lite',
+    keys: ['GEMINI_KEY_1', 'GEMINI_KEY_2', 'GEMINI_KEY_3',
+           'GEMINI_KEY_4', 'GEMINI_KEY_5', 'GEMINI_KEY_6'],
+    thinking: null
   }
 };
 
-// Round-robin cursor per pool so requests spread across available keys.
-const counters = {};
-// In-memory cooldown map for keys that recently returned HTTP 429.
-const rateLimits = new Map(); // key -> expiration timestamp
-const COOLDOWN_MS = 60 * 1000; // 1 minute cooldown for 429s
+// ─── Round-robin counters + rate limit map ────────────────────────────────────
+const counters   = {};
+const rateLimits = new Map(); // apiKey → expiry timestamp
+const COOLDOWN_MS = 60 * 1000; // 1-minute cooldown on 429
 
+// ─── Key selection ────────────────────────────────────────────────────────────
 function getNextKey(poolName, pool, env) {
-  // Get all defined keys
   const keys = pool.keys.map(k => env[k]).filter(Boolean);
-  if (keys.length === 0) {
-    throw new Error(`No configured secrets found for pool: "${poolName}"`);
-  }
+  if (keys.length === 0) throw new Error(`No secrets configured for pool: "${poolName}"`);
 
   const now = Date.now();
-  // Clean up old rate limits
-  for (const [key, expiry] of rateLimits.entries()) {
-    if (expiry < now) rateLimits.delete(key);
+  for (const [k, exp] of rateLimits.entries()) {
+    if (exp < now) rateLimits.delete(k);
   }
 
-  // Find keys not currently rate limited
-  const availableKeys = keys.filter(k => !rateLimits.has(k));
-  
-  if (availableKeys.length === 0) {
-    const err = new Error(`Rate limit hit for model pool "${poolName}". All ${keys.length} keys are currently exhausted.`);
+  const available = keys.filter(k => !rateLimits.has(k));
+
+  if (available.length === 0) {
+    const earliest = Math.min(...keys.map(k => rateLimits.get(k)).filter(Boolean));
+    const err = new Error(
+      `All ${keys.length} keys exhausted for pool "${poolName}".` +
+      (isFinite(earliest) ? ` Retry in ${Math.ceil((earliest - now) / 1000)}s.` : '')
+    );
     err.status = 429;
+    if (isFinite(earliest)) {
+      err.retryAfter   = Math.max(0, earliest - now);
+      err.earliestExpiry = earliest;
+    }
     throw err;
   }
 
   if (!counters[poolName]) counters[poolName] = 0;
-  const apiKey = availableKeys[counters[poolName] % availableKeys.length];
+  const key = available[counters[poolName] % available.length];
   counters[poolName]++;
-  return apiKey;
+  return key;
 }
 
-// Helper for JSON responses with CORS enabled.
-function jsonResponse(payload, status = 200) {
-  return new Response(JSON.stringify(payload), {
-    status,
-    headers: {
-      'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*'
-    }
-  });
+// ─── Apply thinking config per pool ──────────────────────────────────────────
+// Injects the correct thinking parameters based on model generation.
+// IMPORTANT: never mix thinking_budget (2.5) with thinking_level (3.x).
+function applyThinkingConfig(body, pool) {
+  const cfg = pool.thinking;
+  if (!cfg) return body; // pool-lite: leave defaults untouched
+
+  // Strip any client-supplied thinking params to avoid conflicts
+  delete body.thinking_config;
+  delete body.reasoning_effort;
+
+  // Ensure extra_body.google exists
+  body.extra_body = body.extra_body || {};
+  body.extra_body.google = body.extra_body.google || {};
+  delete body.extra_body.google.thinking_config; // remove stale client value
+
+  if (cfg.type === '2.5') {
+    // Gemini 2.5 models: use reasoning_effort at top level (OpenAI compat)
+    // "none" maps to thinking_budget:0 — fully disables thinking, no thought signatures
+    body.reasoning_effort = cfg.reasoning_effort; // "none"
+  } else if (cfg.type === '3.x') {
+    // Gemini 3.x models: use extra_body.google.thinking_config.thinking_level
+    // Valid values: "minimal" | "low" | "medium" | "high"
+    // Cannot be disabled — "minimal" is the floor
+    body.extra_body.google.thinking_config = {
+      thinking_level: cfg.thinking_level
+    };
+  }
+
+  return body;
 }
 
-// Minimal schema check for OpenAI-style chat completion requests.
-function isValidChatBody(body) {
-  if (!body || typeof body !== 'object') return false;
-  if (!body.model || typeof body.model !== 'string') return false;
-  if (!Array.isArray(body.messages) || body.messages.length === 0) return false;
-  return body.messages.every(
-    (m) => m && typeof m.role === 'string' && typeof m.content === 'string'
-  );
-}
-
+// ─── Upstream call with key rotation ─────────────────────────────────────────
 async function callWithRetry(origBody, poolName, pool, env) {
-  // Override the dummy pool name with the actual upstream model name
-  const body = { ...origBody, model: pool.model };
-  const bodyStr = JSON.stringify(body);
-  
-  // Try up to the total number of keys configured. If a key is rate limited,
-  // we immediately add it to the cooldown map and try the next available one.
   const totalKeys = pool.keys.filter(k => Boolean(env[k])).length;
-  if (totalKeys === 0) throw new Error(`No keys for pool ${poolName}`);
+  if (totalKeys === 0) throw new Error(`No keys for pool "${poolName}"`);
+
+  // Apply model name + thinking config before forwarding
+  let body = { ...origBody, model: pool.model };
+  body = applyThinkingConfig(body, pool);
+  const bodyStr = JSON.stringify(body);
 
   for (let attempt = 0; attempt < totalKeys; attempt++) {
-    // This will throw 429 if no keys are currently available
     const apiKey = getNextKey(poolName, pool, env);
 
-    // Build provider-specific endpoint and headers.
-    let url;
+    const url = `https://gateway.ai.cloudflare.com/v1/${env.CF_ACCOUNT_ID}/${env.GATEWAY_NAME}/google-ai-studio/v1beta/openai/chat/completions`;
+
     const headers = {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`
+      'Content-Type':    'application/json',
+      'Authorization':   `Bearer ${apiKey}`
     };
-
-    if (pool.provider === 'gemini') {
-      // Use the native OpenAI compatibility endpoint for Gemini
-      url = `https://gateway.ai.cloudflare.com/v1/${env.CF_ACCOUNT_ID}/${env.GATEWAY_NAME}/google-ai-studio/v1beta/openai/chat/completions`;
-      
-      // AI Gateway requires authorization so it knows the worker is allowed to proxy
-      if (env.CF_API_TOKEN) {
-        headers['cf-aig-authorization'] = `Bearer ${env.CF_API_TOKEN}`;
-      }
-
-    } else if (pool.provider === 'github-models') {
-      url = `https://models.github.ai/inference/chat/completions`;
+    if (env.CF_API_TOKEN) {
+      headers['cf-aig-authorization'] = `Bearer ${env.CF_API_TOKEN}`;
     }
 
-    // Forward the request to the selected upstream endpoint.
     const response = await fetch(url, { method: 'POST', headers, body: bodyStr });
 
     if (response.status === 429) {
-      console.warn(`Key rate limited for pool ${poolName}, applying ${COOLDOWN_MS}ms cooldown.`);
+      console.warn(`[${poolName}] Key rate-limited — cooldown ${COOLDOWN_MS}ms`);
       rateLimits.set(apiKey, Date.now() + COOLDOWN_MS);
-      continue; // Immediately loop and try next key
+      continue;
     }
 
     if (!response.ok) {
-      // Retry on 5xx errors, but throw on 4xx (like bad request)
-      if (response.status >= 500) continue;
-      
+      if (response.status >= 500) continue; // retry on server errors
       const errText = await response.text().catch(() => '');
       const err = new Error(`Upstream error: ${errText}`);
       err.status = response.status;
       throw err;
     }
 
-    // Pass through successful response!
-    // Returning `response.body` natively streams if it's a stream, and just sends JSON if it isn't.
-    const responseHeaders = new Headers();
-    responseHeaders.set('Content-Type', response.headers.get('Content-Type') || 'application/json');
-    responseHeaders.set('Access-Control-Allow-Origin', '*');
-    
-    // Preserve SSE-friendly headers when stream mode is requested.
+    // Stream-safe passthrough
+    const respHeaders = new Headers({
+      'Content-Type':               response.headers.get('Content-Type') || 'application/json',
+      'Access-Control-Allow-Origin': '*'
+    });
     if (body.stream) {
-      responseHeaders.set('Cache-Control', 'no-cache');
-      responseHeaders.set('Connection', 'keep-alive');
+      respHeaders.set('Cache-Control', 'no-cache');
+      respHeaders.set('Connection',    'keep-alive');
     }
 
-    return new Response(response.body, {
-      status: 200,
-      headers: responseHeaders
-    });
+    return new Response(response.body, { status: 200, headers: respHeaders });
   }
 
+  // All keys failed
+  const now = Date.now();
+  const expiries = pool.keys.map(k => env[k]).filter(Boolean)
+    .map(k => rateLimits.get(k)).filter(Boolean);
   const err = new Error(`All keys failing for pool "${poolName}".`);
   err.status = 429;
+  if (expiries.length) {
+    err.retryAfter    = Math.max(0, Math.min(...expiries) - now);
+    err.earliestExpiry = Math.min(...expiries);
+  }
   throw err;
 }
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+function jsonResponse(payload, status = 200) {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: {
+      'Content-Type':               'application/json',
+      'Access-Control-Allow-Origin': '*'
+    }
+  });
+}
+
+// Relaxed validation: content can be string OR array (tool results, multimodal)
+function isValidChatBody(body) {
+  if (!body || typeof body !== 'object')   return false;
+  if (!body.model || typeof body.model !== 'string') return false;
+  if (!Array.isArray(body.messages) || body.messages.length === 0) return false;
+  return body.messages.every(m =>
+    m &&
+    typeof m.role === 'string' &&
+    (typeof m.content === 'string' || Array.isArray(m.content) || m.content === null)
+  );
+}
+
+// ─── Main fetch handler ───────────────────────────────────────────────────────
 export default {
   async fetch(request, env) {
-    // CORS preflight handler.
+
+    // CORS preflight
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         headers: {
-          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Origin':  '*',
           'Access-Control-Allow-Methods': 'POST, OPTIONS',
           'Access-Control-Allow-Headers': 'Content-Type, Authorization'
         }
       });
     }
 
-    // Only handle POST to /v1/chat/completions (OpenAI-compatible)
     const url = new URL(request.url);
+
+    // Health check
+    if (url.pathname === '/health') {
+      return jsonResponse({
+        status: 'ok',
+        pools: Object.keys(POOLS),
+        rateLimited: [...rateLimits.keys()].length
+      });
+    }
+
     if (url.pathname !== '/v1/chat/completions') {
       return new Response('Not found', { status: 404 });
     }
 
-    // Simple shared-secret auth for clients of this proxy.
-    const auth = request.headers.get('Authorization') || '';
-    if (auth !== `Bearer ${env.MASTER_KEY}`) {
+    // Auth
+    const auth        = request.headers.get('Authorization') || '';
+    const expectedAuth = `Bearer ${env.MASTER_KEY}`;
+
+    if (env.DEBUG_AUTH) {
+      console.log(`AUTH_DEBUG matches=${auth === expectedAuth} headerLen=${auth.length}`);
+    }
+
+    if (auth !== expectedAuth) {
       return jsonResponse({ error: 'Unauthorized' }, 401);
     }
 
+    // Parse body
     let body;
     try {
       body = await request.json();
@@ -191,29 +286,37 @@ export default {
     }
 
     if (!isValidChatBody(body)) {
-      return jsonResponse(
-        {
-          error: 'Invalid request body. Required fields: model (string), messages (non-empty array of { role, content })'
-        },
-        400
-      );
+      return jsonResponse({
+        error: 'Invalid body. Required: model (string), messages (array of {role, content})'
+      }, 400);
     }
 
     const poolName = body.model;
-    const pool = POOLS[poolName];
+    const pool     = POOLS[poolName];
 
     if (!pool) {
       return jsonResponse({
-        error: `Unknown model pool: "${poolName}". Available: ${Object.keys(POOLS).join(', ')}`
+        error: `Unknown pool: "${poolName}". Available: ${Object.keys(POOLS).join(', ')}`
+      }, 400);
+    }
+
+    // Block tool calls on high-thinking pool
+    if (pool.disableTools && body.tools) {
+      return jsonResponse({
+        error: `Tool use is not allowed for "${poolName}" (high thinking mode). Use pool-2.5-tools for tool calls.`
       }, 400);
     }
 
     try {
-      // Execute upstream call with key rotation and retry/cooldown behavior.
-      const result = await callWithRetry(body, poolName, pool, env);
-      return result; // callWithRetry already returns a fully formed Response
+      return await callWithRetry(body, poolName, pool, env);
     } catch (err) {
-      return jsonResponse({ error: err.message || 'Request failed' }, err.status || 500);
+      if (err?.status === 429) {
+        const resp = { error: err.message };
+        if (err.retryAfter    != null) resp.retry_after_ms = err.retryAfter;
+        if (err.earliestExpiry)        resp.renew_at       = new Date(err.earliestExpiry).toISOString();
+        return jsonResponse(resp, 429);
+      }
+      return jsonResponse({ error: err.message || 'Request failed' }, err?.status || 500);
     }
   }
 };

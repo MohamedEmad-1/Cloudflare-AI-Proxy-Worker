@@ -20,41 +20,39 @@ flowchart LR
     end
 
     subgraph Providers["AI Providers"]
-        Gemini["Google AI Studio\n(Gemini pool-pro / flash / lite)"]
-        GitHub["GitHub Models\n(DeepSeek V3)"]
+      Gemini["Google AI Studio<br/>(Gemini pools: 2.5-tools, flash, flash-low/med/high, lite)"]
     end
 
     n8n -->|"Authorization: Bearer MASTER_KEY"| Worker
-    Worker -->|"cf-aig-authorization: Bearer CF_API_TOKEN\n+ GEMINI_KEY_x"| Gateway
-    Worker -->|"GITHUB_TOKEN"| GitHub
+    Worker -->|"cf-aig-authorization: Bearer CF_API_TOKEN<br/>+ GEMINI_KEY_x"| Gateway
     Gateway --> Gemini
 ```
 
 **Each layer only sees its own key:**
 - Clients send `MASTER_KEY` — they never see provider keys
 - The Worker sends `CF_API_TOKEN` to AI Gateway and rotates `GEMINI_KEY_x` for Google
-- DeepSeek bypasses the gateway and is called directly with `GITHUB_TOKEN`
 - AI Gateway adds logging, caching, and cost tracking for all Gemini traffic
 
 ## What It Does
 
 - Exposes `POST /v1/chat/completions`
 - Authenticates requests with a single `MASTER_KEY`
-- Maps friendly pool names to real upstream models
+- Maps friendly pool names to real upstream Gemini models
 - Rotates Gemini requests across 6 API keys per pool
 - Applies temporary cooldown when an upstream key returns `429`
-- Proxies Gemini through Cloudflare AI Gateway
-- Proxies DeepSeek V3 through GitHub Models
+- Proxies all requests through Cloudflare AI Gateway
 - Passes through successful upstream responses, including streaming responses
 
 ## Current Model Pools
 
 | Pool name | Upstream provider | Upstream model |
 | --- | --- | --- |
-| `pool-pro` | Google AI Studio | `gemini-3.1-pro-preview` |
-| `pool-flash` | Google AI Studio | `gemini-3-flash-preview` |
-| `pool-flash-lite` | Google AI Studio | `gemini-3.1-flash-lite-preview` |
-| `deepseekv3` | GitHub Models | `deepseek/DeepSeek-V3-0324` |
+| `pool-2.5-tools` | Google AI Studio | `gemini-2.5-flash` |
+| `pool-flash` | Google AI Studio | `gemini-3.5-flash` |
+| `pool-flash-low` | Google AI Studio | `gemini-3.5-flash` |
+| `pool-flash-med` | Google AI Studio | `gemini-3.5-flash` |
+| `pool-flash-high` | Google AI Studio | `gemini-3.5-flash` |
+| `pool-lite` | Google AI Studio | `gemini-3.1-flash-lite` |
 
 ## Project Files
 
@@ -70,7 +68,6 @@ flowchart LR
 - Wrangler login already configured with `npx wrangler login`
 - A Cloudflare AI Gateway created in your account
 - Google AI Studio API keys
-- A GitHub Models token if you want `deepseekv3`
 
 ## Local Setup
 
@@ -92,7 +89,6 @@ copy .dev.vars.example .dev.vars
 - `CF_ACCOUNT_ID`: your Cloudflare account ID
 - `GATEWAY_NAME`: the AI Gateway name used by this Worker
 - `CF_API_TOKEN`: Cloudflare AI Gateway authorization token sent as the `cf-aig-authorization` header when the Worker calls AI Gateway
-- `GITHUB_TOKEN`: GitHub Models token for `deepseekv3`
 - `GEMINI_KEY_1` to `GEMINI_KEY_6`: Google AI Studio API keys
 
 4. Start local dev:
@@ -125,7 +121,6 @@ These are safe to keep in [wrangler.jsonc](wrangler.jsonc). They are identifiers
 
 - `MASTER_KEY`
 - `CF_API_TOKEN`
-- `GITHUB_TOKEN`
 - `GEMINI_KEY_1`
 - `GEMINI_KEY_2`
 - `GEMINI_KEY_3`
@@ -318,10 +313,12 @@ https://<your-worker-domain>/v1
 
 5. Set the model field to one of these pool names:
 
-- `pool-pro`
+- `pool-2.5-tools`
 - `pool-flash`
-- `pool-flash-lite`
-- `deepseekv3`
+- `pool-flash-low`
+- `pool-flash-med`
+- `pool-flash-high`
+- `pool-lite`
 
 6. Send messages as normal chat input.
 

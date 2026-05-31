@@ -114,7 +114,8 @@ POST /v1/chat/completions
 Test at least:
 
 - `pool-flash`
-- `deepseekv3` if GitHub Models is enabled
+- `pool-2.5-tools`
+- `pool-lite`
 
 ## 8. Publish To GitHub
 
